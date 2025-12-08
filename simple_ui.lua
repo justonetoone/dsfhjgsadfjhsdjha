@@ -1,368 +1,167 @@
 --[[
-    simple_ui.lua
-    Simple UI with input handling - Python embedded in Lua
-    Similar structure to get_hwid.lua
-    Uses su -c inside Python for root commands
+    get_hwid_non_root.lua
+    Runs the HWID generator Python script and captures the output.
+    Run with su -c from outside to have root access.
+    
+    Usage:
+    su -c "cd /storage/emulated/0/Reconnect && export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && lua ./get_hwid_non_root.lua"
 ]]
 
-local function run_ui()
-    local python_ui = [=[
-import os
-import subprocess
+local function get_hwid()
+    -- Embedded Python script for HWID generation
+    -- Includes root test function to verify root access
+    local python_hwid = [=[
+import asyncio,hashlib,platform,subprocess,uuid,os
+from typing import Optional,List
 
-def clear_screen():
-    os.system('clear' if os.name == 'posix' else 'cls')
-
-def print_header(title="Main Menu"):
-    print("=" * 50)
-    print(f"        {title}")
-    print("=" * 50)
-    print()
-
-def print_menu(options):
-    for i, option in enumerate(options, 1):
-        print(f"  {i}. {option}")
-    print()
-    print("  0. Exit")
-    print()
-
-def get_input(prompt="Select option: "):
+def test_root_access():
+    """Test if we have root access by trying root-only operations"""
+    results = []
+    
+    # Test 1: Check if running as root (uid 0)
+    uid = os.getuid()
+    results.append(f"UID: {uid} ({'ROOT' if uid == 0 else 'NOT ROOT'})")
+    
+    # Test 2: Try to read /data/system (root only)
     try:
-        return input(prompt).strip()
-    except (EOFError, KeyboardInterrupt):
-        return "0"
-
-def show_message(msg, style="info"):
-    styles = {
-        "info": "[INFO]",
-        "success": "[SUCCESS]",
-        "error": "[ERROR]",
-        "warning": "[WARNING]"
-    }
-    prefix = styles.get(style, "[INFO]")
-    print(f"{prefix} {msg}")
-    print()
-
-def pause():
-    input("Press Enter to continue...")
-
-# ==========================================
-# Root command helpers (su -c)
-# ==========================================
-
-def run_root_cmd(cmd):
-    """Run a command with su -c and return output"""
-    try:
-        result = subprocess.run(
-            ["su", "-c", cmd],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        return result.stdout.strip(), result.stderr.strip(), result.returncode
-    except subprocess.TimeoutExpired:
-        return "", "Command timed out", -1
+        files = os.listdir("/data/system")
+        results.append(f"/data/system: READABLE ({len(files)} files)")
+    except PermissionError:
+        results.append("/data/system: PERMISSION DENIED")
     except Exception as e:
-        return "", str(e), -1
-
-def run_normal_cmd(cmd):
-    """Run a command without root and return output"""
+        results.append(f"/data/system: {e}")
+    
+    # Test 3: Try to read /data/data (root only)
     try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        return result.stdout.strip(), result.stderr.strip(), result.returncode
-    except subprocess.TimeoutExpired:
-        return "", "Command timed out", -1
+        files = os.listdir("/data/data")
+        results.append(f"/data/data: READABLE ({len(files)} apps)")
+    except PermissionError:
+        results.append("/data/data: PERMISSION DENIED")
     except Exception as e:
-        return "", str(e), -1
+        results.append(f"/data/data: {e}")
+    
+    # Test 4: Try to read ro.serialno (often needs root)
+    try:
+        serial = subprocess.check_output(["getprop", "ro.serialno"], text=True, stderr=subprocess.DEVNULL).strip()
+        results.append(f"ro.serialno: {serial if serial else '(empty)'}")
+    except Exception as e:
+        results.append(f"ro.serialno: FAILED - {e}")
+    
+    # Test 5: Try to read /sys/block/mmcblk0/device/serial (may need root)
+    try:
+        with open("/sys/block/mmcblk0/device/serial", "r") as f:
+            storage_serial = f.read().strip()
+        results.append(f"Storage serial: {storage_serial}")
+    except PermissionError:
+        results.append("Storage serial: PERMISSION DENIED")
+    except FileNotFoundError:
+        results.append("Storage serial: FILE NOT FOUND")
+    except Exception as e:
+        results.append(f"Storage serial: {e}")
+    
+    return results
 
-def main_menu():
-    options = [
-        "Run command with su -c",
-        "Run command without root",
-        "Test getprop (su -c)",
-        "Test getprop (no root)",
-        "Read file with su -c",
-        "Compare root vs non-root",
-        "Settings"
-    ]
-    
-    while True:
-        clear_screen()
-        print_header("Root Command Tester")
-        print_menu(options)
-        
-        choice = get_input()
-        
-        if choice == "0":
-            clear_screen()
-            print("Goodbye!")
-            break
-        elif choice == "1":
-            run_custom_root_cmd()
-        elif choice == "2":
-            run_custom_normal_cmd()
-        elif choice == "3":
-            test_getprop_root()
-        elif choice == "4":
-            test_getprop_normal()
-        elif choice == "5":
-            read_file_root()
-        elif choice == "6":
-            compare_root_nonroot()
-        elif choice == "7":
-            settings_menu()
-        else:
-            show_message("Invalid option. Please try again.", "error")
-            pause()
+async def _run_getprop(prop:str)->Optional[str]:
+    loop=asyncio.get_running_loop()
+    try:
+        def _call():
+            try:return subprocess.check_output(["getprop",prop],text=True,stderr=subprocess.DEVNULL).strip()
+            except:return None
+        return await loop.run_in_executor(None,_call)or None
+    except:return None
 
-def run_custom_root_cmd():
-    clear_screen()
-    print_header("Run Command with su -c")
-    
-    print("Enter command to run with root:")
-    cmd = get_input("> ")
-    
-    if cmd:
-        print()
-        print("Running: su -c")
-        print("-" * 40)
-        
-        stdout, stderr, code = run_root_cmd(cmd)
-        
-        print()
-        print("Exit code:")
-        print()
-        if stdout:
-            print("STDOUT:")
-            print(stdout[:500] if len(stdout) > 500 else stdout)
-        if stderr:
-            print("STDERR:")
-            print(stderr[:500] if len(stderr) > 500 else stderr)
-        if not stdout and not stderr:
-            print("(no output)")
-    else:
-        show_message("No command entered.", "warning")
-    
-    print()
-    pause()
-
-def run_custom_normal_cmd():
-    clear_screen()
-    print_header("Run Command (No Root)")
-    
-    print("Enter command to run:")
-    cmd = get_input("> ")
-    
-    if cmd:
-        print()
-        print(f"Running: {cmd}")
-        print("-" * 40)
-        
-        stdout, stderr, code = run_normal_cmd(cmd)
-        
-        print()
-        print(f"Exit code: {code}")
-        print()
-        if stdout:
-            print("STDOUT:")
-            print(stdout[:500] if len(stdout) > 500 else stdout)
-        if stderr:
-            print("STDERR:")
-            print(stderr[:500] if len(stderr) > 500 else stderr)
-        if not stdout and not stderr:
-            print("(no output)")
-    else:
-        show_message("No command entered.", "warning")
-    
-    print()
-    pause()
-
-def test_getprop_root():
-    clear_screen()
-    print_header("Test getprop (su -c)")
-    
-    props = [
-        "ro.product.model",
-        "ro.product.brand",
-        "ro.product.manufacturer",
-        "ro.build.fingerprint",
-        "ro.serialno"
-    ]
-    
-    print("Testing getprop with su -c...")
-    print("-" * 40)
-    print()
-    
-    for prop in props:
-        stdout, stderr, code = run_root_cmd(f"getprop {prop}")
-        status = "OK" if code == 0 and stdout else "FAIL"
-        value = stdout[:40] + "..." if len(stdout) > 40 else stdout
-        print(f"[{status}] {prop}")
-        print(f"      = {value if value else '(empty)'}")
-        print()
-    
-    pause()
-
-def test_getprop_normal():
-    clear_screen()
-    print_header("Test getprop (No Root)")
-    
-    props = [
-        "ro.product.model",
-        "ro.product.brand",
-        "ro.product.manufacturer",
-        "ro.build.fingerprint",
-        "ro.serialno"
-    ]
-    
-    print("Testing getprop without root...")
-    print("-" * 40)
-    print()
-    
-    for prop in props:
-        stdout, stderr, code = run_normal_cmd(f"getprop {prop}")
-        status = "OK" if code == 0 and stdout else "FAIL"
-        value = stdout[:40] + "..." if len(stdout) > 40 else stdout
-        print(f"[{status}] {prop}")
-        print(f"      = {value if value else '(empty)'}")
-        print()
-    
-    pause()
-
-def read_file_root():
-    clear_screen()
-    print_header("Read File with su -c")
-    
-    print("Enter file path to read:")
-    filepath = get_input("> ")
-    
-    if not filepath:
-        filepath = "/proc/version"
-        print(f"Using default: {filepath}")
-    
-    print()
-    print(f"Running: su -c \"cat {filepath}\"")
-    print("-" * 40)
-    
-    stdout, stderr, code = run_root_cmd(f"cat {filepath}")
-    
-    print()
-    print(f"Exit code: {code}")
-    print()
-    if stdout:
-        print("Content:")
-        print(stdout[:1000] if len(stdout) > 1000 else stdout)
-    if stderr:
-        print("Error:")
-        print(stderr)
-    if not stdout and not stderr:
-        print("(no output)")
-    
-    print()
-    pause()
-
-def compare_root_nonroot():
-    clear_screen()
-    print_header("Compare Root vs Non-Root")
-    
-    print("Enter command to compare:")
-    cmd = get_input("> ")
-    
-    if not cmd:
-        cmd = "getprop ro.product.model"
-        print(f"Using default: {cmd}")
-    
-    print()
-    print("=" * 40)
-    print("WITH su -c:")
-    print("=" * 40)
-    stdout1, stderr1, code1 = run_root_cmd(cmd)
-    print(f"Exit: {code1}")
-    print(f"Out: {stdout1[:200] if stdout1 else '(empty)'}")
-    if stderr1:
-        print(f"Err: {stderr1[:100]}")
-    
-    print()
-    print("=" * 40)
-    print("WITHOUT root:")
-    print("=" * 40)
-    stdout2, stderr2, code2 = run_normal_cmd(cmd)
-    print(f"Exit: {code2}")
-    print(f"Out: {stdout2[:200] if stdout2 else '(empty)'}")
-    if stderr2:
-        print(f"Err: {stderr2[:100]}")
-    
-    print()
-    print("=" * 40)
-    print("COMPARISON:")
-    print("=" * 40)
-    if stdout1 == stdout2:
-        print("Results are IDENTICAL")
-    else:
-        print("Results are DIFFERENT")
-    
-    print()
-    pause()
-
-def settings_menu():
-    settings = {
-        "debug_mode": False,
-        "timeout": 10,
-        "show_stderr": True
-    }
-    
-    while True:
-        clear_screen()
-        print_header("Settings")
-        
-        print(f"  1. Debug Mode: {'ON' if settings['debug_mode'] else 'OFF'}")
-        print(f"  2. Command Timeout: {settings['timeout']}s")
-        print(f"  3. Show STDERR: {'ON' if settings['show_stderr'] else 'OFF'}")
-        print()
-        print("  0. Back to Main Menu")
-        print()
-        
-        choice = get_input()
-        
-        if choice == "0":
-            break
-        elif choice == "1":
-            settings['debug_mode'] = not settings['debug_mode']
-            show_message(f"Debug Mode {'enabled' if settings['debug_mode'] else 'disabled'}.", "success")
-            pause()
-        elif choice == "2":
-            new_timeout = get_input("Enter timeout in seconds: ")
+async def _read_file(path:str)->Optional[str]:
+    loop=asyncio.get_running_loop()
+    try:
+        def _read():
             try:
-                settings['timeout'] = int(new_timeout)
-                show_message(f"Timeout set to {settings['timeout']}s.", "success")
-            except ValueError:
-                show_message("Invalid number.", "error")
-            pause()
-        elif choice == "3":
-            settings['show_stderr'] = not settings['show_stderr']
-            show_message(f"Show STDERR {'enabled' if settings['show_stderr'] else 'disabled'}.", "success")
-            pause()
-        else:
-            show_message("Invalid option.", "error")
-            pause()
+                with open(path,"r")as f:return f.read().strip()
+            except:return None
+        return await loop.run_in_executor(None,_read)
+    except:return None
 
-if __name__ == "__main__":
-    try:
-        main_menu()
-    except Exception as e:
-        print(f"[ERROR] {e}")
+async def get_hwid()->str:
+    ids:List[str]=[]
+    props=["ro.product.model","ro.product.name","ro.product.brand","ro.product.manufacturer","ro.product.device","ro.board.platform","ro.hardware","ro.build.fingerprint","ro.bootloader","ro.serialno"]
+    for p in props:
+        v=await _run_getprop(p)
+        if v:ids.append(v)
+    kv=await _read_file("/proc/version")
+    if kv:ids.append(kv.replace(" ",""))
+    cpu=await _read_file("/proc/cpuinfo")
+    if cpu:ids.append(cpu)
+    stor=await _read_file("/sys/block/mmcblk0/device/serial")
+    if stor:ids.append(stor)
+    hwid=None
+    if ids:hwid=hashlib.sha256("-".join(filter(None,ids)).encode()).hexdigest()
+    if not hwid:
+        fb=[str(uuid.getnode()),platform.node(),platform.machine()]
+        hwid=hashlib.sha256("-".join(filter(None,fb)).encode()).hexdigest()
+    return hwid
+
+# Run root test first
+print("ROOT_TEST_START")
+for line in test_root_access():
+    print(line)
+print("ROOT_TEST_END")
+
+# Then get HWID
+print("HWID:" + asyncio.run(get_hwid()))
 ]=]
 
-    os.execute('python3 -c "' .. python_ui:gsub('"', '\\"') .. '"')
+    -- Use io.popen to capture Python output
+    local handle = io.popen('python3 -c "' .. python_hwid:gsub('"', '\\"') .. '"')
+    local output = nil
+    
+    if handle then
+        output = handle:read("*a")
+        handle:close()
+    end
+    
+    return output
 end
 
 
 -- Main entry point
-run_ui()
+print("")
+print("==============================================")
+print("   HWID Generator with Root Test")
+print("==============================================")
+print("")
 
+local output = get_hwid()
+
+if output and output ~= "" then
+    -- Parse the output
+    local in_root_test = false
+    local hwid = nil
+    
+    print("[ROOT ACCESS TEST]")
+    print("-" .. string.rep("-", 44))
+    
+    for line in output:gmatch("[^\r\n]+") do
+        if line == "ROOT_TEST_START" then
+            in_root_test = true
+        elseif line == "ROOT_TEST_END" then
+            in_root_test = false
+            print("-" .. string.rep("-", 44))
+            print("")
+        elseif in_root_test then
+            print("  " .. line)
+        elseif line:match("^HWID:") then
+            hwid = line:sub(6)
+        end
+    end
+    
+    if hwid and hwid ~= "" then
+        print("[HWID GENERATED]")
+        print("")
+        print("  " .. hwid)
+        print("")
+        print("Length: " .. #hwid .. " characters")
+    else
+        print("[ERROR] Failed to extract HWID")
+    end
+else
+    print("[ERROR] Failed to run Python script")
+end
